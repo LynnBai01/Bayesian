@@ -1,0 +1,342 @@
+---
+title: "Apply Bayesian logistic regression in bank marketing prediction"
+author: "MasterMu"
+date: "10/25/2016"
+output: pdf_document
+number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Introduction
+
+In this study I will apply the Bayesian logistic regression in the bank marketing compaign prediction. The data is related with direct marketing campaigns of a Portuguese banking institution. The bank marketing compaigns were based on phone calls. Often, more than one contact to the same client was required, in order to access if the product (bank term deposit) would be ('yes') or not ('no') subscribed. The data set can be downloaded from UCI Machine Learning REpository, see <https://archive.ics.uci.edu/ml/datasets/Bank+Marketing>.
+
+The data set consists 16 independent variables and 1 resposne variable. The independent variables include 7 numeric variables and 9 categorical variables. The resposne variable 'y' indicates if the client subscribed a term deposit. A summary of the data set is given below.  
+
+```{r}
+dat <- read.table('bank.csv',header=TRUE,sep = ';')
+dat <- dat[sample(nrow(dat),3000),]
+summary(dat)
+```
+
+Since the response variable is binary, i.e., 'yes' or 'no', we can formulate a binary classification problem using the data set. Binary classification problems can commonly be solved by a variety of models, among which logistic regression is quite popular becasue of its simplicity. Specifically, I would build up a logistic regression model under the Bayesian framework.
+
+## Methodology
+
+### Data preparation
+
+The data contains 45211 samples which are all complete, i.e., without missing values. Thus, there is no need to perform any missing value imputation.
+
+For the 9 categorical variables, I would encode them with the corresponding log-odd-ratio in order to transform them to numeric variables:
+
+```{r,echo=F}
+n <- nrow(dat)
+dat_numeric <-dat
+cat_variables=setdiff(names(which(sapply(dat[1,],is.factor))),'y')
+dat_numeric[,cat_variables]=0
+for (v in cat_variables){
+    freq= table(dat[,v])/n
+      for (l in names(freq)){
+            dat_numeric[dat[,v]==l,v]=freq[[l]]
+        }
+}
+
+```
+
+```{r,mvtnorm}
+
+library(mvtnorm)
+head(dat_numeric)
+```
+
+Before fit the data with a regression model, I would also scale the variables to make each variable centored and normalized.
+
+```{r,echo=F}
+X=dat_numeric
+X$y=NULL
+y=ifelse(dat_numeric$y=='yes',1,0)
+X= t( (t(X)-apply(X,2,mean))/apply(X,2,sd))
+X=cbind(1,X)
+colnames(X)[1]='intercept'
+```
+
+### Model Specification
+
+I use $x_{i,j}$ to denote variable $j$ for sample $i$, and use $Y_i$ to denote its response. Consider a logistic regression model of the form 
+$Pr\left(Y_i = 1 | \mathbf{x_i,\gamma,\beta}\right) = exp\left(\theta_i\right)/\left(1+exp\left(\theta_i\right)\right)$ where
+
+$$\theta_i=\beta_0+\beta_1\gamma_1 x_{i,1}+...+\beta_{16}\gamma_{16} x_{i,{16}}$$
+
+In the model, $\gamma_i$ is either 0 or 1 to indicate if the variable is selected or not.
+I assume the prior distribution of each $\gamma_i$ is indpendent of each other and following a bernoulli distribution. As for $\beta_j$, I assume each one has independent normal prior distribution. The parameters of these prior distributions are given in the R code.
+
+### MCMC algorithm to approximate the posterior distribution
+
+In this section, I would implement the Monte Carlo Markov chain to approximate the posterior distribution of both $\mathbf{\beta}$ and $\mathbf{\gamma}$. Specifically, the MCMC algorithm used in this study is Metropolis-Hastings.
+
+To start the MCMC approximation, I would first fit the logistic regression by maximum likelihood estimation in order to set proper parameters for the prior distributions of $\mathbf{\beta}$.
+
+```{r,echo=F}
+mle.model <- glm(y~ -1 + X, family ='binomial')
+summary(mle.model)
+```
+
+To start the MH algorithm with appropriate parameter set up.
+```{r, MCMCpack,echo=F}
+library(MCMCpack)
+p<-17
+#proposal variance for beta
+beta.var.prop<-summary(mle.model)$cov.unscaled
+#prior parameters
+pmn.beta<-rep(0,p)
+psd.beta<-c(4,rep(2,p-1))
+#starting values for beta and gamma
+beta<-coef(mle.model)
+acs_beta<-0
+gamma<-c(1,rbinom(p-1,1,0.5))
+
+#MH algorithm parameters and results matrices
+S<-1000
+BETA<-NULL
+GAMMA<-NULL
+set.seed(1)
+#inverse logit function
+ilogit<-function(x) 1/(1+exp(-x))
+for(s in 1:S){ #lpy.c==currrent log-likelihood
+  
+  lpy.c<-sum(dbinom(y,1,ilogit(X[,gamma==1,drop=FALSE]%*%beta[gamma==1]),log=T))
+  #UPDATE GAMMAs
+  for(j in sample(2:p))
+  {
+    gamma_p<-gamma ; gamma_p[j]<-1-gamma_p[j]
+    #lpy.p==proposal loglikelihood
+    lpy.p<-sum(dbinom(y,1,ilogit(X[,gamma_p==1,drop=FALSE]%*%
+                                   beta[gamma_p==1,drop=FALSE]),log=T))
+    lhr<-(lpy.p-lpy.c)*(-1)^(gamma_p[j]==0)
+    gamma[j]<-rbinom(1,1,1/(1+exp(-lhr)))
+    if(gamma[j]==gamma_p[j]) {lpy.c<-lpy.p}
+  }
+  GAMMA<-rbind(GAMMA,gamma)
+  #UPDATE BETA
+  beta.p<-rmvnorm(1,beta,beta.var.prop)
+  lpy_beta.p<-sum(dbinom(y,1,ilogit(X[,gamma==1,drop=FALSE]%*%
+                                      beta.p[gamma==1]),log=T))
+  lhr.beta<-lpy_beta.p-lpy.c+sum(dnorm(beta.p,pmn.beta,psd.beta,log=T))-
+    sum(dnorm(beta,pmn.beta,psd.beta,log=T))
+  if(log(runif(1))<lhr.beta) {beta<-beta.p; acs_beta<-acs_beta+1}
+  BETA<-rbind(BETA,beta) }
+```
+### Result Analysis
+
+Based on the MCMC results, I plot the traceplots for $\mathbf{\beta_j^{\left(s\right)}}$, $\mathbf{\gamma_j^{\left(s\right)}}$ and $\mathbf{\gamma_j^{\left(s\right)}}\mathbf{\beta_j^{\left(s\right)}}$
+
+```{r,echo=F}
+par(mfrow=c(5,2),mar=c(2,5,2,2)+0,oma=c(0,0,0,0)+0.5)
+plot(BETA[,1],xlab = 'iter',ylab=expression(beta[0]))
+plot(BETA[,2],xlab = 'iter',ylab=expression(beta[2]))
+plot(BETA[,3],xlab = 'iter',ylab=expression(beta[3]))
+plot(BETA[,4],xlab = 'iter',ylab=expression(beta[4]))
+plot(BETA[,5],xlab = 'iter',ylab=expression(beta[5]))
+plot(BETA[,6],xlab = 'iter',ylab=expression(beta[6]))
+plot(BETA[,7],xlab = 'iter',ylab=expression(beta[7]))
+plot(BETA[,8],xlab = 'iter',ylab=expression(beta[8]))
+plot(BETA[,9],xlab = 'iter',ylab=expression(beta[9]))
+plot(BETA[,10],xlab = 'iter',ylab=expression(beta[10]))
+```
+```{r,echo=F}
+par(mfrow=c(4,2),mar=c(2,5,2,2)+0,oma=c(0,0,0,0)+0.5)
+plot(BETA[,11],xlab = 'iter',ylab=expression(beta[11]))
+plot(BETA[,12],xlab = 'iter',ylab=expression(beta[12]))
+plot(BETA[,13],xlab = 'iter',ylab=expression(beta[13]))
+plot(BETA[,14],xlab = 'iter',ylab=expression(beta[14]))
+plot(BETA[,15],xlab = 'iter',ylab=expression(beta[15]))
+plot(BETA[,16],xlab = 'iter',ylab=expression(beta[16]))
+plot(BETA[,17],xlab = 'iter',ylab=expression(beta[17]))
+```
+
+```{r,echo=F}
+par(mfrow=c(5,2),mar=c(2,5,2,2)+0,oma=c(0,0,0,0)+0.5)
+plot(GAMMA[,1],xlab = 'iter',ylab=expression(gamma[0]))
+plot(GAMMA[,2],xlab = 'iter',ylab=expression(gamma[2]))
+plot(GAMMA[,3],xlab = 'iter',ylab=expression(gamma[3]))
+plot(GAMMA[,4],xlab = 'iter',ylab=expression(gamma[4]))
+plot(GAMMA[,5],xlab = 'iter',ylab=expression(gamma[5]))
+plot(GAMMA[,6],xlab = 'iter',ylab=expression(gamma[6]))
+plot(GAMMA[,7],xlab = 'iter',ylab=expression(gamma[7]))
+plot(GAMMA[,8],xlab = 'iter',ylab=expression(gamma[8]))
+plot(GAMMA[,9],xlab = 'iter',ylab=expression(gamma[9]))
+plot(GAMMA[,10],xlab = 'iter',ylab=expression(gamma[10]))
+```
+```{r,echo=F}
+par(mfrow=c(4,2),mar=c(2,5,2,2)+0,oma=c(0,0,0,0)+0.5)
+plot(GAMMA[,11],xlab = 'iter',ylab=expression(gamma[11]))
+plot(GAMMA[,12],xlab = 'iter',ylab=expression(gamma[12]))
+plot(GAMMA[,13],xlab = 'iter',ylab=expression(gamma[13]))
+plot(GAMMA[,14],xlab = 'iter',ylab=expression(gamma[14]))
+plot(GAMMA[,15],xlab = 'iter',ylab=expression(gamma[15]))
+plot(GAMMA[,16],xlab = 'iter',ylab=expression(gamma[16]))
+plot(GAMMA[,17],xlab = 'iter',ylab=expression(gamma[17]))
+```
+
+
+
+```{r,echo=F}
+par(mfrow=c(5,2),mar=c(2,5,2,2)+0,oma=c(0,0,0,0)+0.5)
+
+plot(BETA[,1]*GAMMA[,1],xlab = 'iter',ylab=expression(beta[0]*gamma[0]))
+plot(BETA[,2]*GAMMA[,2],xlab = 'iter',ylab=expression(beta[2]*gamma[2]))
+plot(BETA[,3]*GAMMA[,3],xlab = 'iter',ylab=expression(beta[3]*gamma[3]))
+plot(BETA[,4]*GAMMA[,4],xlab = 'iter',ylab=expression(beta[4]*gamma[4]))
+plot(BETA[,5]*GAMMA[,5],xlab = 'iter',ylab=expression(beta[5]*gamma[5]))
+plot(BETA[,6]*GAMMA[,6],xlab = 'iter',ylab=expression(beta[6]*gamma[6]))
+plot(BETA[,7]*GAMMA[,7],xlab = 'iter',ylab=expression(beta[7]*gamma[7]))
+plot(BETA[,8]*GAMMA[,8],xlab = 'iter',ylab=expression(beta[8]*gamma[8]))
+plot(BETA[,9]*GAMMA[,9],xlab = 'iter',ylab=expression(beta[9]*gamma[9]))
+plot(BETA[,10]*GAMMA[,10],xlab = 'iter',ylab=expression(beta[10]*gamma[10]))
+```
+```{r,echo=F}
+par(mfrow=c(4,2),mar=c(2,5,2,2)+0,oma=c(0,0,0,0)+0.5)
+plot(BETA[,11]*GAMMA[,11],xlab = 'iter',ylab=expression(gamma[11]*beta[11]))
+plot(BETA[,12]*GAMMA[,12],xlab = 'iter',ylab=expression(gamma[12]*beta[12]))
+plot(BETA[,13]*GAMMA[,13],xlab = 'iter',ylab=expression(gamma[13]*beta[13]))
+plot(BETA[,14]*GAMMA[,14],xlab = 'iter',ylab=expression(gamma[14]*beta[14]))
+plot(BETA[,15]*GAMMA[,15],xlab = 'iter',ylab=expression(gamma[15]*beta[15]))
+plot(BETA[,16]*GAMMA[,16],xlab = 'iter',ylab=expression(gamma[16]*beta[16]))
+plot(BETA[,17]*GAMMA[,17],xlab = 'iter',ylab=expression(gamma[17]*beta[17]))
+```
+
+The traceplots for $\beta$ show non-stationarity of the MCMC chains for $\beta_1$,$\beta_2$,$\beta_3$,$\beta_4$,$\beta_5$,$\beta_6$,$\beta_{11}$,$\beta_{15}$,$\beta_{16}$.
+
+On the other hand, we can also see the predominant draws of $\gamma_1^{\left(s\right)}$,
+$\gamma_2^{\left(s\right)}$,$\gamma_3^{\left(s\right)}$,
+$\gamma_4^{\left(s\right)}$,$\gamma_5^{\left(s\right)}$,$\gamma_6^{\left(s\right)}$,$\gamma_{11}^{\left(s\right)}$,$\gamma_{15}^{\left(s\right)}$ and $\gamma_{16}^{\left(s\right)}$ to be 0s.
+
+So the result indicates that the following variables are not predictors of the response of the client:
+```{r,echo=F}
+colnames(dat_numeric)[c(1:6,11,15,16)]
+```
+
+```{r,echo=F}
+a <- colMeans(GAMMA)
+names(a) <- colnames(X)
+b <- colMeans(GAMMA*BETA)
+names(b) <- colnames(X)
+```
+
+```{r,echo=F}
+print(a)
+```
+The posterior means of $\gamma$ are displayed above and indicate that "age", "job",  "marital", "education", "default", "balance", "month", "previous", "poutcome" are not important variables for the prediction.
+
+### Model Checking
+
+To get a better understanding of the Bayesian, I also perform autocorrelation analysis of the MCMC approximation.
+
+```{r}
+
+```
+
+```{r,echo=F}
+par(mfrow=c(5,2),mar=c(2,5,2,2)+0,oma=c(0,0,0,0)+0.5)
+acf(BETA[,1],xlab = 'lag',ylab=expression(beta[0]))
+acf(BETA[,2],xlab = 'lag',ylab=expression(beta[1]))
+acf(BETA[,3],xlab = 'lag',ylab=expression(beta[2]))
+acf(BETA[,4],xlab = 'lag',ylab=expression(beta[3]))
+acf(BETA[,5],xlab = 'lag',ylab=expression(beta[4]))
+acf(BETA[,6],xlab = 'lag',ylab=expression(beta[5]))
+acf(BETA[,7],xlab = 'lag',ylab=expression(beta[6]))
+acf(BETA[,8],xlab = 'lag',ylab=expression(beta[7]))
+acf(BETA[,9],xlab = 'lag',ylab=expression(beta[8]))
+acf(BETA[,10],xlab = 'lag',ylab=expression(beta[9]))
+```
+
+```{r,echo=F}
+par(mfrow=c(4,2),mar=c(2,5,2,2)+0,oma=c(0,0,0,0)+0.5)
+acf(BETA[,11],xlab = 'lag',ylab=expression(beta[10]))
+acf(BETA[,12],xlab = 'lag',ylab=expression(beta[11]))
+acf(BETA[,13],xlab = 'lag',ylab=expression(beta[12]))
+acf(BETA[,14],xlab = 'lag',ylab=expression(beta[13]))
+acf(BETA[,15],xlab = 'lag',ylab=expression(beta[14]))
+acf(BETA[,16],xlab = 'lag',ylab=expression(beta[15]))
+acf(BETA[,17],xlab = 'lag',ylab=expression(beta[16]))
+```
+
+The autocorrelation plots who high autocorrelations to be concerned about. So the current posterior estimates of $\gamma$ are not reliable. One option is to thin the MCMC process. But thinning would reduce the accuracy a bit.
+
+Next, I would average the posterior parameters over only active iterations instead of the whole traces.
+
+```{r,echo=F}
+par(mfrow=c(5,2),mar=c(2,5,2,2)+0,oma=c(0,0,0,0)+0.5)
+acf(BETA[,1]*GAMMA[,1],xlab = 'lag',ylab=expression(beta[0]))
+acf(BETA[,2]*GAMMA[,2],xlab = 'lag',ylab=expression(beta[1]))
+acf(BETA[,3]*GAMMA[,3],xlab = 'lag',ylab=expression(beta[2]))
+acf(BETA[,4]*GAMMA[,4],xlab = 'lag',ylab=expression(beta[3]))
+acf(BETA[,5]*GAMMA[,5],xlab = 'lag',ylab=expression(beta[4]))
+acf(BETA[,6]*GAMMA[,6],xlab = 'lag',ylab=expression(beta[5]))
+acf(BETA[,7]*GAMMA[,7],xlab = 'lag',ylab=expression(beta[6]))
+acf(BETA[,8]*GAMMA[,8],xlab = 'lag',ylab=expression(beta[7]))
+acf(BETA[,9]*GAMMA[,9],xlab = 'lag',ylab=expression(beta[8]))
+acf(BETA[,10]*GAMMA[,10],xlab = 'lag',ylab=expression(beta[9]))
+```
+
+```{r,echo=F}
+par(mfrow=c(4,2),mar=c(2,5,2,2)+0,oma=c(0,0,0,0)+0.5)
+acf(BETA[,11]*GAMMA[,11],xlab = 'lag',ylab=expression(beta[10]))
+acf(BETA[,12]*GAMMA[,12],xlab = 'lag',ylab=expression(beta[11]))
+acf(BETA[,13]*GAMMA[,13],xlab = 'lag',ylab=expression(beta[12]))
+acf(BETA[,14]*GAMMA[,14],xlab = 'lag',ylab=expression(beta[13]))
+acf(BETA[,15]*GAMMA[,15],xlab = 'lag',ylab=expression(beta[14]))
+acf(BETA[,16]*GAMMA[,16],xlab = 'lag',ylab=expression(beta[15]))
+acf(BETA[,17]*GAMMA[,17],xlab = 'lag',ylab=expression(beta[16]))
+```
+
+The new acf plot seems better than before when I only average the active iterations.
+
+Posterior mean of $\gamma_j \beta_j$ is displayed below:
+```{r,echo=F}
+print(b)
+```
+
+```{r,echo=T}
+d=apply(GAMMA*BETA,2, function(x) mean(exp(x)))
+names(d) <- colnames(X)
+d
+```
+
+Some varialbes are associated with a decrease in the odds of subscribion and some variables are associated with an increase in the odds.
+
+The posterior densities of $\beta_j$ are also checked:
+
+```{r,echo=F}
+par(mfrow=c(5,2),mar=c(4,1,1,1)+0,oma=c(0,0,0,0)+0.5)
+plot(density(BETA[,1]*GAMMA[,1]),main=NA,xlab=expression(beta[0]*gamma[0]))
+plot(density(BETA[,2]*GAMMA[,2]),main=NA,xlab=expression(beta[1]*gamma[1]))
+plot(density(BETA[,3]*GAMMA[,3]),main=NA,xlab=expression(beta[2]*gamma[2]))
+plot(density(BETA[,4]*GAMMA[,4]),main=NA,xlab=expression(beta[3]*gamma[3]))
+plot(density(BETA[,5]*GAMMA[,5]),main=NA,xlab=expression(beta[4]*gamma[4]))
+plot(density(BETA[,6]*GAMMA[,6]),main=NA,xlab=expression(beta[5]*gamma[5]))
+plot(density(BETA[,7]*GAMMA[,7]),main=NA,xlab=expression(beta[6]*gamma[6]))
+plot(density(BETA[,8]*GAMMA[,8]),main=NA,xlab=expression(beta[7]*gamma[7]))
+plot(density(BETA[,9]*GAMMA[,9]),main=NA,xlab=expression(beta[8]*gamma[8]))
+plot(density(BETA[,10]*GAMMA[,10]),main=NA,xlab=expression(beta[9]*gamma[9]))
+```
+
+```{r,echo=F}
+par(mfrow=c(4,2),mar=c(4,1,1,1)+0,oma=c(0,0,0,0)+0.5)
+plot(density(BETA[,11]*GAMMA[,11]),main=NA,xlab=expression(gamma[10]*beta[10]))
+plot(density(BETA[,12]*GAMMA[,12]),main=NA,xlab=expression(gamma[11]*beta[11]))
+plot(density(BETA[,13]*GAMMA[,13]),main=NA,xlab=expression(gamma[12]*beta[12]))
+plot(density(BETA[,14]*GAMMA[,14]),main=NA,xlab=expression(gamma[13]*beta[13]))
+plot(density(BETA[,15]*GAMMA[,15]),main=NA,xlab=expression(gamma[14]*beta[14]))
+plot(density(BETA[,16]*GAMMA[,16]),main=NA,xlab=expression(gamma[15]*beta[15]))
+plot(density(BETA[,17]*GAMMA[,17]),main=NA,xlab=expression(gamma[16]*beta[16]))
+```
+
+From the posterior plots, the densities for $\beta_4 \gamma_4$ and $\beta_{14} \gamma_{14}$ are somewhat bimodal.
+
+## Conclusion
+
+In this study, I apply the Bayesian logistic regression to fit the bank marketing data. MCMC approximation of poseterior estimates of parameters are done by MH algorithm. From the MCMC results, we can see which variables are not important for the prediction and which variables are important. The acf check show that the MCMC process is somewhat correlated and thinning may be helpful. The posterior mean estiamtes of parameters are also given.
